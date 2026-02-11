@@ -9,6 +9,7 @@ import io
 
 # --- CONFIGURAÇÕES ---
 NOME_ABA = '2021_Base RPA'
+# Define hoje à meia-noite para comparações
 DATA_HOJE = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
 
 month_map = {
@@ -19,19 +20,14 @@ month_map = {
 # --- FUNÇÕES AUXILIARES ---
 
 def clean_val(v, tipo='metal'):
-    if v is None:
-        return None
+    if v is None: return None
     s = str(v).strip().upper()
-    if 'FERIADO' in s or s in ['-', '']:
-        return 'FERIADO'
+    if 'FERIADO' in s or s in ['-', '']: return 'FERIADO'
     try:
-        if tipo == 'metal':        # 2,604.00
-            val = s.replace(',', '')
-        else:                      # 5,40
-            val = s.replace('.', '').replace(',', '.')
+        if tipo == 'metal': val = s.replace(',', '') 
+        else: val = s.replace('.', '').replace(',', '.')
         return float(val)
-    except:
-        return s
+    except: return s
 
 @st.cache_data(ttl=3600)
 def get_shock_metais(ano_inicio):
@@ -41,144 +37,124 @@ def get_shock_metais(ano_inicio):
 
     for ano in range(ano_inicio, hoje.year + 1):
         for mes in range(1, 13):
-            if ano == hoje.year and mes > hoje.month:
-                break
-
+            if ano == hoje.year and mes > hoje.month: break
+            
             url = f'https://shockmetais.com.br/lme/{mes}-{ano}'
             try:
                 res = requests.get(url, timeout=10, headers=headers, verify=False)
-                if res.status_code != 200:
-                    continue
-
+                if res.status_code != 200: continue
+                
                 soup = BeautifulSoup(res.content, "html.parser")
                 tbody = soup.find('tbody')
-                if not tbody:
-                    continue
-
+                if not tbody: continue
+                
                 for r in tbody.find_all('tr'):
                     tds = r.find_all('td')
-                    if len(tds) < 8 or 'Média' in tds[0].text:
-                        continue
-
+                    if len(tds) < 8 or 'Média' in tds[0].text: continue
+                    
                     raw_date = tds[0].get_text(strip=True).lower()
-                    if '/' not in raw_date:
-                        continue
-
+                    if '/' not in raw_date: continue
+                    
                     dia, m_abbr = raw_date.split('/')
                     m_num = month_map.get(m_abbr[:3])
-                    if not m_num:
-                        continue
-
+                    if not m_num: continue
+                    
                     dt_obj = datetime(ano, m_num, int(dia))
-                    if dt_obj > DATA_HOJE:
-                        continue
+                    
+                    # Filtra apenas para não pegar futuro (hoje ainda pegamos no scraping, filtramos na escrita)
+                    if dt_obj > DATA_HOJE: continue
 
                     data_rows.append({
-                        'Data': dt_obj,
+                        'Data': dt_obj, 
                         'Cobre': clean_val(tds[1].text, 'metal'),
-                        'Zinco': clean_val(tds[2].text, 'metal'),
+                        'Zinco': clean_val(tds[2].text, 'metal'), 
                         'Chumbo': clean_val(tds[4].text, 'metal'),
-                        'Niquel': clean_val(tds[6].text, 'metal'),
+                        'Niquel': clean_val(tds[6].text, 'metal'), 
                         'Dolar': clean_val(tds[7].text, 'moeda')
                     })
-            except:
-                continue
-
+            except: continue
+    
     df = pd.DataFrame(data_rows)
     if not df.empty:
         df = df.drop_duplicates(subset='Data').set_index('Data')
-    return df
+        return df
+    return pd.DataFrame()
 
 @st.cache_data(ttl=3600)
 def get_euro(data_inicio_str):
     try:
-        euro_df = yf.download(
-            "EURBRL=X",
-            start=data_inicio_str,
-            progress=False
-        )['Close'].reset_index()
-
+        euro_df = yf.download("EURBRL=X", start=data_inicio_str, progress=False)['Close'].reset_index()
         euro_df.columns = ['Data', 'Euro']
         euro_df['Data'] = pd.to_datetime(euro_df['Data']).dt.tz_localize(None)
         return euro_df.set_index('Data')
-    except:
-        return pd.DataFrame()
+    except: return pd.DataFrame()
 
 def processar_planilha(uploaded_file):
     wb = load_workbook(uploaded_file)
-
+    
     if NOME_ABA not in wb.sheetnames:
         return None, f"Erro: Aba '{NOME_ABA}' não encontrada no arquivo."
-
+    
     ws = wb[NOME_ABA]
-
+    
     # 1. Descobrir último ano preenchido
     ultimo_ano = 2024
-
+    
     for row in ws.iter_rows(min_row=3, values_only=True):
         data_val, dolar_val = row[0], row[1]
         dt = None
-
-        if isinstance(data_val, datetime):
-            dt = data_val
+        if isinstance(data_val, datetime): dt = data_val
         elif isinstance(data_val, str):
-            try:
-                dt = datetime.strptime(data_val.split()[0], "%d/%m/%Y")
-            except:
-                pass
-
-        if dt and dt <= DATA_HOJE:
+            try: dt = datetime.strptime(data_val.split()[0], "%d/%m/%Y")
+            except: pass
+        
+        # Consideramos apenas datas ANTERIORES a hoje para definir o histórico
+        if dt and dt < DATA_HOJE:
             if dolar_val not in [None, ""]:
                 ultimo_ano = dt.year
             else:
                 ultimo_ano = max(2024, dt.year)
                 break
-
+    
     start_year = max(2024, ultimo_ano)
 
     # 2. Coleta de dados
     df_site = get_shock_metais(start_year)
     df_euro = get_euro(f"{start_year}-01-01")
-
+    
     df_completo = df_site.copy()
     if not df_euro.empty:
         df_completo = df_completo.join(df_euro, how='left')
-        df_completo['Euro'] = df_completo['Euro'].ffill()  # 🔑 CORREÇÃO PRINCIPAL
+        df_completo['Euro'] = df_completo['Euro'].ffill()
 
     # 3. Preenchimento
     ups = 0
-
+    
     for row_idx in range(3, 15000):
         cell_data = ws.cell(row=row_idx, column=1).value
-
-        # Fim do arquivo
+        
+        # Fim do arquivo (check 9 linhas vazias)
         if cell_data is None:
-            vazios = sum(
-                ws.cell(row=row_idx + k, column=1).value is None
-                for k in range(1, 10)
-            )
-            if vazios == 9:
-                break
+            vazios = sum(ws.cell(row=row_idx+k, column=1).value is None for k in range(1, 10))
+            if vazios == 9: break
             continue
 
-        # Normaliza data
+        # Normaliza Data
         dt = None
         if isinstance(cell_data, datetime):
             dt = cell_data.replace(hour=0, minute=0, second=0, microsecond=0)
         else:
             try:
-                s = str(cell_data).split()[0]
-                if '/' in s:
-                    dt = datetime.strptime(s, "%d/%m/%Y")
-                elif '-' in s:
-                    dt = datetime.strptime(s, "%Y-%m-%d")
-            except:
-                continue
+                s = str(cell_data).split(' ')[0]
+                if '/' in s: dt = datetime.strptime(s, "%d/%m/%Y")
+                elif '-' in s: dt = datetime.strptime(s, "%Y-%m-%d")
+            except: continue
+        
+        # --- ALTERAÇÃO SOLICITADA 1 ---
+        # Se a data for HOJE ou FUTURO, pula (não preenche)
+        if not dt or dt >= DATA_HOJE: continue
 
-        if not dt or dt > DATA_HOJE:
-            continue
-
-        # Fim de semana
+        # Fim de semana (Sáb=5, Dom=6)
         if dt.weekday() in [5, 6]:
             for col in [2, 4, 6, 8, 10, 12]:
                 c = ws.cell(row=row_idx, column=col)
@@ -191,28 +167,23 @@ def processar_planilha(uploaded_file):
         if not df_completo.empty and dt in df_completo.index:
             dados = df_completo.loc[dt]
             mapeamento = {
-                2: dados.get('Dolar'),
-                4: dados.get('Euro'),
-                6: dados.get('Cobre'),
-                8: dados.get('Zinco'),
-                10: dados.get('Niquel'),
-                12: dados.get('Chumbo')
+                2: dados.get('Dolar'), 4: dados.get('Euro'), 6: dados.get('Cobre'),
+                8: dados.get('Zinco'), 10: dados.get('Niquel'), 12: dados.get('Chumbo')
             }
-
+            
             linha_mexida = False
             for col, val in mapeamento.items():
                 c = ws.cell(row=row_idx, column=col)
                 if pd.notna(val) and c.value in [None, "", 0]:
                     c.value = val
                     linha_mexida = True
-
-            if linha_mexida:
-                ups += 1
+            
+            if linha_mexida: ups += 1
 
     output = io.BytesIO()
     wb.save(output)
     output.seek(0)
-
+    
     return output, f"Sucesso! {ups} linhas foram atualizadas."
 
 # --- INTERFACE STREAMLIT ---
@@ -223,7 +194,7 @@ st.title("📈 Atualizador de Cotações LME")
 st.markdown("""
 Faça o upload da planilha **cotacao_bcb_lme.xlsx**.
 O sistema irá:
-1. Identificar datas faltantes.
+1. Identificar datas faltantes (até o dia anterior ao atual).
 2. Baixar dados da Shock Metais e Yahoo Finance.
 3. Preencher lacunas (Sáb/Dom serão marcados como **FIM DE SEMANA**).
 """)
@@ -233,13 +204,14 @@ uploaded_file = st.file_uploader("Escolha o arquivo Excel", type=["xlsx"])
 if uploaded_file and st.button("🚀 Processar e Atualizar", type="primary"):
     with st.status("Processando...", expanded=True):
         processed_data, msg = processar_planilha(uploaded_file)
-
+        
         if processed_data:
             st.success(msg)
+            # --- ALTERAÇÃO SOLICITADA 2: NOME DO ARQUIVO LIMPO ---
             st.download_button(
                 label="📥 Baixar Planilha Pronta",
                 data=processed_data,
-                file_name=f"cotacao_bcb_lme_atualizada_{datetime.now():%Y-%m-%d}.xlsx",
+                file_name="cotacao_bcb_lme.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
         else:
